@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -84,6 +85,26 @@ class OpenAICompatLLM:
                         arguments=str(fn.get("arguments") or "{}"),
                     )
                 )
+
+            # Fallback: some providers place function call payloads in content as
+            # <tool_call>{"name":"...","arguments":{...}}</tool_call>.
+            if not tool_calls and content:
+                match = re.search(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", content)
+                if match:
+                    payload_text = match.group(1)
+                    payload = json.loads(payload_text)
+                    name = str(payload.get("name") or "")
+                    arguments_value = payload.get("arguments") or {}
+                    if not isinstance(arguments_value, dict):
+                        arguments_value = {}
+                    tool_calls.append(
+                        ToolCall(
+                            id="content-tool-call-1",
+                            name=name,
+                            arguments=json.dumps(arguments_value, ensure_ascii=False),
+                        )
+                    )
+                    content = ""
             return ChatResponse(content=content, tool_calls=tool_calls)
         except Exception as exc:
             raise RuntimeError(f"Invalid LLM response: {body}") from exc

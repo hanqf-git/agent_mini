@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -17,6 +19,20 @@ def add_tool(args: dict) -> str:
 def now_tool(args: dict) -> str:
     _ = args
     return datetime.now().isoformat(timespec="seconds")
+
+
+def current_time_tool(args: dict) -> str:
+    _ = args
+    now = datetime.now().astimezone()
+    return "\n".join(
+        [
+            f"iso_datetime: {now.isoformat(timespec='seconds')}",
+            f"date: {now.date().isoformat()}",
+            f"time: {now.time().strftime('%H:%M:%S')}",
+            f"timezone: {now.tzname() or 'local'}",
+            f"unix_timestamp: {int(now.timestamp())}",
+        ]
+    )
 
 
 def fetch_url_tool(args: dict) -> str:
@@ -60,6 +76,108 @@ def fetch_url_tool(args: dict) -> str:
     return f"URL: {url}\\nStatus: {status}\\nContent-Type: {content_type}\\nBody: {snippet}"
 
 
+def tavily_search_tool(args: dict) -> str:
+    api_key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TAVILY_API_KEY is not set")
+
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+
+    max_results = int(args.get("max_results", 5))
+    max_results = max(1, min(max_results, 10))
+
+    search_depth = str(args.get("search_depth", "basic")).strip().lower()
+    if search_depth not in {"basic", "advanced"}:
+        raise ValueError("search_depth must be 'basic' or 'advanced'")
+
+    include_answer = bool(args.get("include_answer", True))
+    include_raw_content = bool(args.get("include_raw_content", False))
+    proxy_url = str(
+        args.get("proxy_url")
+        or os.getenv("TAVILY_PROXY_URL")
+        or "http://child-prc.intel.com:913"
+    ).strip()
+
+    payload = {
+        "api_key": api_key,
+        "query": query.strip(),
+        "search_depth": search_depth,
+        "max_results": max_results,
+        "include_answer": include_answer,
+        "include_raw_content": include_raw_content,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "MinimalAgent/1.0",
+            "Authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
+        },
+    )
+
+    try:
+        if proxy_url:
+            proxy_handler = urllib.request.ProxyHandler(
+                {
+                    "http": proxy_url,
+                    "https": proxy_url,
+                }
+            )
+            opener = urllib.request.build_opener(proxy_handler)
+            with opener.open(request, timeout=20) as resp:
+                body = resp.read().decode("utf-8")
+        else:
+            with urllib.request.urlopen(request, timeout=20) as resp:
+                body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Tavily HTTP error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        if proxy_url:
+            raise RuntimeError(f"Tavily connection error via proxy {proxy_url}: {exc}") from exc
+        raise RuntimeError(f"Tavily connection error: {exc}") from exc
+
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid Tavily response: {body}") from exc
+
+    answer = str(result.get("answer") or "").strip()
+    results = result.get("results") or []
+    if not isinstance(results, list):
+        results = []
+
+    lines: list[str] = []
+    if answer:
+        lines.append(f"Answer: {answer}")
+
+    if not results:
+        lines.append("Results: (none)")
+        return "\n".join(lines)
+
+    lines.append("Results:")
+    for idx, item in enumerate(results[:max_results], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "(untitled)").strip()
+        url = str(item.get("url") or "").strip()
+        content = str(item.get("content") or "").strip()
+        snippet = re.sub(r"\s+", " ", content)[:500] if content else ""
+        lines.append(f"{idx}. {title}")
+        if url:
+            lines.append(f"   URL: {url}")
+        if snippet:
+            lines.append(f"   Snippet: {snippet}")
+
+    return "\n".join(lines)
+
+
 def build_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
@@ -92,6 +210,18 @@ def build_default_registry() -> ToolRegistry:
     )
     registry.register(
         Tool(
+            name="current_time",
+            description="Get current local date/time, timezone and unix timestamp.",
+            handler=current_time_tool,
+            parameters_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        )
+    )
+    registry.register(
+        Tool(
             name="fetch_url",
             description="Fetch public web content from a URL and return cleaned text.",
             handler=fetch_url_tool,
@@ -112,6 +242,45 @@ def build_default_registry() -> ToolRegistry:
                     },
                 },
                 "required": ["url"],
+                "additionalProperties": False,
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="tavily_search",
+            description="Search the web with Tavily and return a concise answer plus top results.",
+            handler=tavily_search_tool,
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for web results.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Optional number of results to return, defaults to 5 (1-10).",
+                    },
+                    "search_depth": {
+                        "type": "string",
+                        "enum": ["basic", "advanced"],
+                        "description": "Optional Tavily search depth, defaults to basic.",
+                    },
+                    "include_answer": {
+                        "type": "boolean",
+                        "description": "Whether Tavily should return a synthesized answer, defaults to true.",
+                    },
+                    "include_raw_content": {
+                        "type": "boolean",
+                        "description": "Whether Tavily should include raw page content, defaults to false.",
+                    },
+                    "proxy_url": {
+                        "type": "string",
+                        "description": "Optional proxy URL. Defaults to env TAVILY_PROXY_URL or http://child-prc.intel.com:913.",
+                    },
+                },
+                "required": ["query"],
                 "additionalProperties": False,
             },
         )

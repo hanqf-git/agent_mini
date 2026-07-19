@@ -30,7 +30,8 @@ def load_dotenv_file(dotenv_path: str = ".env") -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip("\"'")
-        if key and key not in os.environ:
+        if key:
+            # Prefer .env values for local development to avoid stale shell env overrides.
             os.environ[key] = value
 
 
@@ -39,8 +40,8 @@ def build_llm_from_env() -> OpenAICompatLLM | None:
     if not api_key:
         return None
 
-    base_url = os.getenv("AIDEMO_BASE_URL", "https://aidemo.intel.cn/v1/chat/completions")
-    model = os.getenv("AIDEMO_MODEL", "minimax-latest")
+    base_url = os.getenv("AIDEMO_BASE_URL", "https://gateway.aichina.intel.com/v1")
+    model = os.getenv("AIDEMO_MODEL", "qwen3-vl-235b-a22b-instruct-fp8")
     timeout_seconds = int(os.getenv("AIDEMO_TIMEOUT", "30"))
     config = LLMConfig(
         base_url=base_url,
@@ -55,7 +56,15 @@ def main() -> None:
     load_dotenv_file()
     debug = _is_debug_enabled(sys.argv[1:])
     llm = build_llm_from_env()
-    agent = SimpleAgent(build_default_registry(), llm=llm, debug=debug)
+    reflection_max_rounds = int(os.getenv("AIDEMO_REFLECTION_MAX_ROUNDS", "5"))
+    reflection_pass_score = float(os.getenv("AIDEMO_REFLECTION_PASS_SCORE", "8.0"))
+    agent = SimpleAgent(
+        build_default_registry(),
+        llm=llm,
+        debug=debug,
+        reflection_max_rounds=reflection_max_rounds,
+        reflection_pass_score=reflection_pass_score,
+    )
     mode = "LLM enabled" if llm else "LLM disabled"
     debug_mode = "DEBUG on" if debug else "DEBUG off"
     print(f"Simple Agent started ({mode}, {debug_mode}). 输入 tools 查看工具，输入 exit 退出。")
