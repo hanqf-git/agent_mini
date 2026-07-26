@@ -58,12 +58,14 @@ def main() -> None:
     llm = build_llm_from_env()
     reflection_max_rounds = int(os.getenv("AIDEMO_REFLECTION_MAX_ROUNDS", "5"))
     reflection_pass_score = float(os.getenv("AIDEMO_REFLECTION_PASS_SCORE", "8.0"))
+    execution_mode = os.getenv("AIDEMO_AGENT_MODE", "auto")
     agent = SimpleAgent(
         build_default_registry(),
         llm=llm,
         debug=debug,
         reflection_max_rounds=reflection_max_rounds,
         reflection_pass_score=reflection_pass_score,
+        execution_mode=execution_mode,
     )
     mode = "LLM enabled" if llm else "LLM disabled"
     debug_mode = "DEBUG on" if debug else "DEBUG off"

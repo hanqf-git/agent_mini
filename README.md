@@ -41,6 +41,7 @@ python -m src.main
 - `AIDEMO_API_KEY`（或 `OPENAI_API_KEY`）
 - `TAVILY_API_KEY`（启用 `tavily_search` 工具时需要）
 - `TAVILY_PROXY_URL`（可选，默认 `http://child-prc.intel.com:913`）
+- `AIDEMO_AGENT_MODE`（可选，`auto`/`react`/`plan_react`，默认 `auto`）
 
 Windows PowerShell 示例：
 
@@ -50,6 +51,7 @@ $env:AIDEMO_MODEL = "qwen3-vl-235b-a22b-instruct-fp8"
 $env:AIDEMO_API_KEY = "<your_api_key>"
 $env:TAVILY_API_KEY = "<your_tavily_api_key>"
 $env:TAVILY_PROXY_URL = "http://child-prc.intel.com:913"
+$env:AIDEMO_AGENT_MODE = "auto"
 py -m src.main
 ```
 
@@ -59,6 +61,7 @@ py -m src.main
 
 - 查看工具列表: `tools`
 - 手动调试工具（可选）: `call <tool_name> <json_args>`
+- 切换执行模式: `/mode <auto|react|plan_react>`
 - 退出: `exit`
 
 示例:
@@ -66,6 +69,7 @@ py -m src.main
 - 自动工具调用示例: `现在几点了？`（模型会自动调用 `now`）
 - 自动工具调用示例: `帮我算 3 + 5`（模型会自动调用 `add`）
 - 自动工具调用示例: `帮我搜索今天的 AI 新闻`（模型可调用 `tavily_search`）
+- Planning 示例: `请给我一个调研英伟达和英特尔AI芯片竞争格局的步骤化方案并总结`（`auto` 模式通常会切到 `plan_react`）
 - 手动调试: `call add {"a": 3, "b": 5}`
 - 手动调试: `call tavily_search {"query": "latest AI news", "max_results": 3}`
 

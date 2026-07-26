@@ -26,6 +26,7 @@ class SimpleAgent:
         debug_printer: Callable[[str], None] | None = None,
         reflection_max_rounds: int = 5,
         reflection_pass_score: float = 8.0,
+        execution_mode: str = "auto",
     ) -> None:
         self.registry = registry
         self.llm = llm
@@ -34,6 +35,10 @@ class SimpleAgent:
         self.debug_printer = debug_printer or (lambda msg: print(msg))
         self.reflection_max_rounds = max(1, int(reflection_max_rounds))
         self.reflection_pass_score = max(0.0, min(float(reflection_pass_score), 10.0))
+        normalized_mode = execution_mode.strip().lower()
+        if normalized_mode not in {"auto", "react", "plan_react"}:
+            normalized_mode = "auto"
+        self.execution_mode = normalized_mode
 
     def _debug(self, message: str) -> None:
         if not self.debug:
@@ -57,6 +62,10 @@ class SimpleAgent:
             self._debug("route=tools")
             return AgentResult(ok=True, message=self._render_tools())
 
+        if text.startswith("/mode"):
+            self._debug("route=mode_switch")
+            return self._handle_mode_command(text)
+
         if text.startswith("call "):
             self._debug("route=manual_tool_call")
             return self._handle_call(text)
@@ -69,24 +78,72 @@ class SimpleAgent:
         return AgentResult(ok=True, message=self._default_response(text))
 
     def _handle_llm(self, text: str) -> AgentResult:
-        assert self.llm is not None
-        system_prompt = (
+        mode = self._select_execution_mode(text)
+        self._debug(f"execution_mode_selected configured={self.execution_mode} selected={mode}")
+        if mode == "plan_react":
+            return self._handle_plan_react(text)
+        return self._run_react_flow(text)
+
+    def _select_execution_mode(self, text: str) -> str:
+        if self.execution_mode in {"react", "plan_react"}:
+            return self.execution_mode
+
+        lower_text = text.lower()
+        planning_keywords = [
+            "计划",
+            "步骤",
+            "方案",
+            "roadmap",
+            "plan",
+            "compare",
+            "comparison",
+            "对比",
+            "分析",
+            "report",
+            "总结",
+        ]
+        contains_planning_keyword = any(k in lower_text for k in planning_keywords)
+        is_long_query = len(text) >= 48
+        has_many_clauses = text.count("，") + text.count(",") + text.count(";") >= 2
+
+        if contains_planning_keyword or (is_long_query and has_many_clauses):
+            return "plan_react"
+        return "react"
+
+    def _build_react_system_prompt(self) -> str:
+        return (
             "你是一个可调用工具的智能体。"
             "你可以直接使用已提供的工具，不需要用户手动输入 call 命令。"
             "若工具足以回答问题，先调用工具再给最终答案。"
             "若用户问题包含 now/current/currently/today/当前/现在 等时间语义，"
             "优先调用时间工具获取当前时间后再回答。"
         )
+
+    def _run_react_flow(
+        self,
+        text: str,
+        *,
+        include_history: bool = True,
+        persist_history: bool = True,
+        enable_reflection: bool = True,
+    ) -> AgentResult:
+        assert self.llm is not None
+        system_prompt = self._build_react_system_prompt()
+        history_messages = self.history if include_history else []
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            *self.history,
+            *history_messages,
             {"role": "user", "content": text},
         ]
 
         tool_specs = self.registry.to_openai_tools()
         max_tool_rounds = 30
         self._debug(
-            f"llm_start history_messages={len(self.history)} tools={len(tool_specs)} max_rounds={max_tool_rounds}"
+            "llm_start "
+            f"history_messages={len(history_messages)} "
+            f"tools={len(tool_specs)} "
+            f"max_rounds={max_tool_rounds} "
+            f"reflection={enable_reflection}"
         )
 
         try:
@@ -122,7 +179,7 @@ class SimpleAgent:
                     answer = response.content or "模型没有返回内容。"
                     if used_tools:
                         self._debug("reflection_skipped reason=tool_grounded_response")
-                    else:
+                    elif enable_reflection:
                         self._debug(
                             "reflection_entry "
                             f"enabled={self.llm is not None} "
@@ -131,10 +188,13 @@ class SimpleAgent:
                             f"draft={self._compact(answer)}"
                         )
                         answer = self._reflect_and_revise_answer(text, answer)
+                    else:
+                        self._debug("reflection_skipped reason=disabled_for_flow")
                     messages[-1]["content"] = answer
                     self._debug(f"llm_final_answer={self._compact(answer)}")
-                    self.history.extend(messages[1:])
-                    self._debug(f"history_updated total_messages={len(self.history)}")
+                    if persist_history:
+                        self.history.extend(messages[1:])
+                        self._debug(f"history_updated total_messages={len(self.history)}")
                     return AgentResult(ok=True, message=answer)
 
                 for tc in response.tool_calls:
@@ -177,6 +237,93 @@ class SimpleAgent:
         except Exception as exc:
             self._debug(f"llm_error={self._compact(exc)}")
             return AgentResult(ok=False, message=f"LLM 调用失败: {exc}")
+
+    def _extract_plan_steps(self, text: str) -> list[str]:
+        payload = self._extract_json_object(text)
+        if payload is None:
+            return []
+
+        steps_raw = payload.get("steps")
+        if not isinstance(steps_raw, list):
+            return []
+
+        steps: list[str] = []
+        for item in steps_raw:
+            if not isinstance(item, str):
+                continue
+            step = item.strip()
+            if step:
+                steps.append(step)
+        return steps[:8]
+
+    def _build_plan(self, user_text: str) -> list[str]:
+        assert self.llm is not None
+        system_prompt = (
+            "你是任务规划助手。"
+            "请把用户任务拆解为 3 到 6 个可执行步骤。"
+            "只输出 JSON 对象，格式为 {\"steps\": [\"...\"]}。"
+        )
+        user_prompt = (
+            f"用户任务:\n{user_text}\n\n"
+            "请输出可执行步骤计划。"
+        )
+        response = self.llm.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+        self._debug(f"plan_raw={self._compact(response.content)}")
+        steps = self._extract_plan_steps(response.content)
+        if not steps:
+            self._debug("plan_parse_failed fallback_to_single_step")
+            return ["直接完成用户请求并返回最终结果"]
+        self._debug(f"plan_parsed steps={self._compact(steps)}")
+        return steps
+
+    def _handle_plan_react(self, text: str) -> AgentResult:
+        assert self.llm is not None
+        steps = self._build_plan(text)
+        step_results: list[str] = []
+        self._debug(f"plan_start step_count={len(steps)}")
+
+        for idx, step in enumerate(steps, start=1):
+            step_prompt = (
+                "你在执行一个多步骤任务。\n"
+                f"原始任务:\n{text}\n\n"
+                f"当前步骤 ({idx}/{len(steps)}):\n{step}\n\n"
+                "请完成此步骤。必要时调用工具。"
+                "输出该步骤结果摘要。"
+            )
+            self._debug(f"plan_step_start index={idx} step={self._compact(step)}")
+            step_result = self._run_react_flow(
+                step_prompt,
+                include_history=False,
+                persist_history=False,
+                enable_reflection=False,
+            )
+            if not step_result.ok:
+                return AgentResult(ok=False, message=f"计划步骤 {idx} 执行失败: {step_result.message}")
+            step_results.append(step_result.message)
+            self._debug(f"plan_step_result index={idx} result={self._compact(step_result.message)}")
+
+        plan_lines = "\n".join([f"{i}. {s}" for i, s in enumerate(steps, start=1)])
+        result_lines = "\n\n".join(
+            [f"步骤{i}结果:\n{r}" for i, r in enumerate(step_results, start=1)]
+        )
+        final_prompt = (
+            f"用户原始请求:\n{text}\n\n"
+            f"计划:\n{plan_lines}\n\n"
+            f"步骤执行结果:\n{result_lines}\n\n"
+            "请基于上述信息给出最终答案。"
+        )
+        self._debug("plan_synthesize_start")
+        return self._run_react_flow(
+            final_prompt,
+            include_history=True,
+            persist_history=True,
+            enable_reflection=True,
+        )
 
     def _extract_json_object(self, text: str) -> dict[str, Any] | None:
         stripped = text.strip()
@@ -365,6 +512,28 @@ class SimpleAgent:
             self._debug(f"manual_tool_error name={tool_name} error={self._compact(exc)}")
             return AgentResult(ok=False, message=f"工具调用失败: {exc}")
 
+    def _handle_mode_command(self, text: str) -> AgentResult:
+        # format: /mode <auto|react|plan_react>
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1:
+            return AgentResult(
+                ok=True,
+                message=(
+                    f"当前模式: {self.execution_mode}\n"
+                    "用法: /mode <auto|react|plan_react>"
+                ),
+            )
+
+        requested = parts[1].strip().lower()
+        if requested not in {"auto", "react", "plan_react"}:
+            return AgentResult(
+                ok=False,
+                message="模式无效。可选: auto, react, plan_react",
+            )
+
+        self.execution_mode = requested
+        return AgentResult(ok=True, message=f"已切换模式为: {self.execution_mode}")
+
     def _render_tools(self) -> str:
         tools = self.registry.list_tools()
         if not tools:
@@ -379,5 +548,6 @@ class SimpleAgent:
         return (
             "我是一个最小 Agent。\n"
             "你可以输入 `tools` 查看工具，或使用 `call <tool_name> <json_args>` 调用工具。\n"
+            "你也可以输入 `/mode <auto|react|plan_react>` 切换执行模式。\n"
             f"你刚刚说的是: {text}"
         )
