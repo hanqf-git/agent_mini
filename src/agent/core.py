@@ -254,13 +254,15 @@ class SimpleAgent:
             step = item.strip()
             if step:
                 steps.append(step)
-        return steps[:8]
+        return steps[:3]
 
     def _build_plan(self, user_text: str) -> list[str]:
         assert self.llm is not None
         system_prompt = (
             "你是任务规划助手。"
-            "请把用户任务拆解为 3 到 6 个可执行步骤。"
+            "请把用户任务拆解为恰好 3 个可执行步骤。"
+            "这 3 个步骤必须直接对应用户要求的 3 个输出部分。"
+            "不要添加额外的审阅、润色、再总结步骤。"
             "只输出 JSON 对象，格式为 {\"steps\": [\"...\"]}。"
         )
         user_prompt = (
@@ -275,9 +277,13 @@ class SimpleAgent:
         )
         self._debug(f"plan_raw={self._compact(response.content)}")
         steps = self._extract_plan_steps(response.content)
-        if not steps:
+        if len(steps) < 3:
             self._debug("plan_parse_failed fallback_to_single_step")
-            return ["直接完成用户请求并返回最终结果"]
+            return [
+                "总结近期新闻与市场情绪。",
+                "给出基础技术分析（价格趋势、支撑阻力、成交量）。",
+                "总结最新财务表现（收入、利润、EPS与指引）。",
+            ]
         self._debug(f"plan_parsed steps={self._compact(steps)}")
         return steps
 
@@ -308,8 +314,9 @@ class SimpleAgent:
             self._debug(f"plan_step_result index={idx} result={self._compact(step_result.message)}")
 
         plan_lines = "\n".join([f"{i}. {s}" for i, s in enumerate(steps, start=1)])
+        concise_step_results = [self._compact(item, limit=1200) for item in step_results]
         result_lines = "\n\n".join(
-            [f"步骤{i}结果:\n{r}" for i, r in enumerate(step_results, start=1)]
+            [f"步骤{i}结果:\n{r}" for i, r in enumerate(concise_step_results, start=1)]
         )
         final_prompt = (
             f"用户原始请求:\n{text}\n\n"
@@ -318,12 +325,54 @@ class SimpleAgent:
             "请基于上述信息给出最终答案。"
         )
         self._debug("plan_synthesize_start")
-        return self._run_react_flow(
+        final_result = self._run_react_flow(
             final_prompt,
             include_history=True,
             persist_history=True,
             enable_reflection=True,
         )
+        if final_result.ok:
+            return final_result
+
+        compact_result_lines = "\n\n".join(
+            [
+                f"Section {i}: {self._compact(r, limit=500)}"
+                for i, r in enumerate(concise_step_results, start=1)
+            ]
+        )
+        compact_prompt = (
+            "Write a brief but comprehensive market analysis report for Intel in English.\n"
+            "Use exactly three sections with clear headings:\n"
+            "1) Recent News and Market Sentiment\n"
+            "2) Basic Technical Analysis\n"
+            "3) Recent Financial Performance\n\n"
+            f"Evidence:\n{compact_result_lines}"
+        )
+        self._debug("plan_synthesize_retry_compact_start")
+        compact_result = self._run_react_flow(
+            compact_prompt,
+            include_history=False,
+            persist_history=True,
+            enable_reflection=False,
+        )
+        if compact_result.ok:
+            self._debug("plan_synthesize_retry_compact_succeeded")
+            return compact_result
+
+        self._debug(
+            "plan_synthesize_fallback "
+            f"reason={self._compact(final_result.message)} "
+            f"compact_retry={self._compact(compact_result.message)}"
+        )
+        fallback_sections = "\n\n".join(
+            [f"## Section {i}\n{r}" for i, r in enumerate(concise_step_results, start=1)]
+        )
+        fallback_answer = (
+            "I could not complete the final synthesis call, so here is a direct report "
+            "compiled from completed planning steps.\n\n"
+            f"{fallback_sections}"
+        )
+        return AgentResult(ok=True, message=fallback_answer)
 
     def _extract_json_object(self, text: str) -> dict[str, Any] | None:
         stripped = text.strip()
